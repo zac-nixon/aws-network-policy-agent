@@ -3,7 +3,6 @@ package clihelper
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -151,13 +150,14 @@ func printPolicyEntry[T any](key utils.BPFTrieKey, entries [24]T) {
 	fmt.Println("*******************************")
 }
 
-// MapWalk - Displays content of individual maps (IPv4)
-func MapWalkCP(mapID int) error {
-	return MapWalk(mapID, "cp_")
-}
-
-// MapWalk - Displays content of individual maps (IPv4)
-func MapWalk(mapID int, mapNamePrefix string) error {
+// MapWalkAuto dumps the contents of a single map, auto-detecting the IP family
+// from the kernel-reported key size. The operator no longer needs to know
+// whether the node is running in IPv4 or IPv6 mode: LPM_TRIE and LRU_HASH maps
+// carry family-specific key layouts (an IPv4 address is 4 bytes, an IPv6
+// address is 16), so their key size is an unambiguous discriminator. HASH maps
+// (pod_state_map) hold no address and are decoded the same way for both
+// families.
+func MapWalkAuto(mapID int) error {
 	if mapID <= 0 {
 		return fmt.Errorf("Invalid mapID")
 	}
@@ -168,274 +168,276 @@ func MapWalk(mapID int, mapNamePrefix string) error {
 	}
 
 	mapInfo, err := goebpfmaps.GetBPFmapInfo(mapFD)
+	unix.Close(mapFD)
 	if err != nil {
 		return fmt.Errorf("failed to get map info: %w", err)
 	}
 
-	unix.Close(mapFD)
-
 	switch mapInfo.Type {
-	case constdef.BPF_MAP_TYPE_LPM_TRIE.Index(),
-		constdef.BPF_MAP_TYPE_LRU_HASH.Index(),
-		constdef.BPF_MAP_TYPE_HASH.Index():
-		// Supported map types — continue
+	case constdef.BPF_MAP_TYPE_LPM_TRIE.Index():
+		switch mapInfo.KeySize {
+		case uint32(unsafe.Sizeof(utils.BPFTrieKey{})): // IPv4 (8 bytes)
+			return walkPolicyTrieV4(mapID, false)
+		case uint32(unsafe.Sizeof(utils.BPFTrieKeyV6{})): // IPv6 (20 bytes)
+			return walkPolicyTrieV6(mapID)
+		default:
+			return fmt.Errorf("unexpected LPM_TRIE key size %d (want %d for IPv4 or %d for IPv6)",
+				mapInfo.KeySize, unsafe.Sizeof(utils.BPFTrieKey{}), unsafe.Sizeof(utils.BPFTrieKeyV6{}))
+		}
+	case constdef.BPF_MAP_TYPE_LRU_HASH.Index():
+		switch mapInfo.KeySize {
+		case uint32(unsafe.Sizeof(utils.ConntrackKey{})): // IPv4 (24 bytes)
+			return walkConntrackV4(mapID)
+		case uint32(unsafe.Sizeof(utils.ConntrackKeyV6{})): // IPv6 (60 bytes)
+			return walkConntrackV6(mapID)
+		default:
+			return fmt.Errorf("unexpected LRU_HASH key size %d (want %d for IPv4 or %d for IPv6)",
+				mapInfo.KeySize, unsafe.Sizeof(utils.ConntrackKey{}), unsafe.Sizeof(utils.ConntrackKeyV6{}))
+		}
+	case constdef.BPF_MAP_TYPE_HASH.Index():
+		return walkPodState(mapID)
 	default:
 		return fmt.Errorf("unsupported map type: %d (expected LPM_TRIE, LRU_HASH, or HASH)", mapInfo.Type)
 	}
+}
 
-	if mapInfo.Type == constdef.BPF_MAP_TYPE_LPM_TRIE.Index() {
-		var iterKey, iterNextKey utils.BPFTrieKey
+// MapWalkCP dumps a Cluster Network Policy LPM_TRIE map (IPv4). Cluster vs.
+// pod-scoped policy is not distinguishable from the key size, so this remains an
+// explicit entry point rather than part of MapWalkAuto's detection.
+func MapWalkCP(mapID int) error {
+	if mapID <= 0 {
+		return fmt.Errorf("Invalid mapID")
+	}
+	return walkPolicyTrieV4(mapID, true)
+}
 
-		err = goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), mapID)
-		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				fmt.Println("No Entries found, Empty map")
-				return nil
-			}
-			return fmt.Errorf("Unable to get First key: %v", err)
+// walkPolicyTrieV4 walks an IPv4 policy LPM_TRIE. When clusterPolicy is true the
+// entries are decoded as Cluster Network Policy values, otherwise as pod-scoped
+// Network Policy values.
+func walkPolicyTrieV4(mapID int, clusterPolicy bool) error {
+	var iterKey, iterNextKey utils.BPFTrieKey
+
+	err := goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), mapID)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("No Entries found, Empty map")
+			return nil
 		}
-
-		for {
-			if strings.Contains(mapNamePrefix, "cp_") {
-				if err := dumpClusterPolicyEntry(iterKey, mapID); err != nil {
-					fmt.Printf("error reading ClusterNetworkPolicy entry: %v\n", err)
-				}
-			} else {
-				if err := dumpNetworkPolicyEntry(iterKey, mapID); err != nil {
-					fmt.Printf("error reading NetworkPolicy entry: %v\n", err)
-				}
-			}
-
-			err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), uintptr(unsafe.Pointer(&iterNextKey)), mapID)
-			if errors.Is(err, unix.ENOENT) {
-				fmt.Println("Done reading all entries")
-				break
-			}
-			if err != nil {
-				fmt.Println("Failed to get next entry Done searching")
-				break
-			}
-			iterKey = iterNextKey
-		}
-
+		return fmt.Errorf("Unable to get First key: %v", err)
 	}
 
-	if mapInfo.Type == constdef.BPF_MAP_TYPE_LRU_HASH.Index() {
-		iterKey := utils.ConntrackKey{}
-		iterNextKey := utils.ConntrackKey{}
-		// Read once so every entry in this dump is aged against the same instant.
-		// A failure here only costs the age column, so carry on with the dump.
-		dumpNow, clockErr := utils.KtimeGetNs()
-		if clockErr != nil {
-			fmt.Printf("unable to read monotonic clock, ages will show as 0s: %v\n", clockErr)
-		}
-		err = goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), mapID)
-		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				fmt.Println("No Entries found, Empty map")
-				return nil
+	for {
+		if clusterPolicy {
+			if err := dumpClusterPolicyEntry(iterKey, mapID); err != nil {
+				fmt.Printf("error reading ClusterNetworkPolicy entry: %v\n", err)
 			}
-			return fmt.Errorf("Unable to get First key: %v", err)
 		} else {
-			for {
-				iterValue := utils.ConntrackVal{}
-				err = goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), uintptr(unsafe.Pointer(&iterValue)), mapID)
-				if err != nil {
-					return fmt.Errorf("Unable to get map entry: %v", err)
-				} else {
-					retrievedKey := fmt.Sprintf("Conntrack Key : Source IP - %s Source port - %d Dest IP - %s Dest port - %d Protocol - %d Owner IP - %s Ifindex - %d", utils.ConvIntToIPv4(iterKey.Source_ip).String(), iterKey.Source_port, utils.ConvIntToIPv4(iterKey.Dest_ip).String(), iterKey.Dest_port, iterKey.Protocol, utils.ConvIntToIPv4(iterKey.Owner_ip).String(), iterKey.Ifindex)
-					fmt.Println(retrievedKey)
-					fmt.Println("Value : ")
-					fmt.Println("Conntrack Val - ", iterValue.Value)
-					fmt.Printf("Last Seen (ns) -  %d  (%s)\n", iterValue.LastSeen, formatLastSeen(iterValue.LastSeen, dumpNow))
-					fmt.Println("*******************************")
-				}
-
-				err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), uintptr(unsafe.Pointer(&iterNextKey)), mapID)
-				if errors.Is(err, unix.ENOENT) {
-					fmt.Println("Done reading all entries")
-					break
-				}
-				if err != nil {
-					fmt.Println("Failed to get next entry Done searching")
-					break
-				}
-				iterKey = iterNextKey
+			if err := dumpNetworkPolicyEntry(iterKey, mapID); err != nil {
+				fmt.Printf("error reading NetworkPolicy entry: %v\n", err)
 			}
 		}
-	}
 
-	if mapInfo.Type == constdef.BPF_MAP_TYPE_HASH.Index() {
-		var key, nextKey uint32
-		// Get the first entry
-		err = goebpfmaps.GetFirstMapEntryByID(
-			uintptr(unsafe.Pointer(&key)),
-			mapID)
+		err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), uintptr(unsafe.Pointer(&iterNextKey)), mapID)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("Done reading all entries")
+			break
+		}
 		if err != nil {
-			if errors.Is(err, unix.ENOENT) {
-				fmt.Println("No entries found, empty HASH map (pod_state_map?)")
-				return nil
-			}
-			return fmt.Errorf("unable to get first key (HASH): %v", err)
+			fmt.Println("Failed to get next entry Done searching")
+			break
 		}
-
-		for {
-			var val PodState
-			err = goebpfmaps.GetMapEntryByID(
-				uintptr(unsafe.Pointer(&key)),
-				uintptr(unsafe.Pointer(&val)),
-				mapID)
-			if err != nil {
-				return fmt.Errorf("unable to get HASH entry for key=%d: %v", key, err)
-			}
-
-			fmt.Println("Key : ", key)
-			fmt.Println("State - ", val.State)
-			fmt.Println("*******************************")
-
-			err = goebpfmaps.GetNextMapEntryByID(
-				uintptr(unsafe.Pointer(&key)),
-				uintptr(unsafe.Pointer(&nextKey)),
-				mapID)
-			if errors.Is(err, unix.ENOENT) {
-				fmt.Println("Done reading all entries in BPF_MAP_TYPE_HASH")
-				break
-			}
-			if err != nil {
-				fmt.Println("Failed to get next entry, done searching")
-				break
-			}
-			key = nextKey
-		}
-		return nil
+		iterKey = iterNextKey
 	}
 
 	return nil
 }
 
-// MapWalkv6 - Displays contents of individual maps (IPv6)
-func MapWalkv6(mapID int) error {
-	if mapID <= 0 {
-		return fmt.Errorf("Invalid mapID")
+// walkConntrackV4 walks an IPv4 conntrack LRU_HASH map.
+func walkConntrackV4(mapID int) error {
+	iterKey := utils.ConntrackKey{}
+	iterNextKey := utils.ConntrackKey{}
+	// Read once so every entry in this dump is aged against the same instant.
+	// A failure here only costs the age column, so carry on with the dump.
+	dumpNow, clockErr := utils.KtimeGetNs()
+	if clockErr != nil {
+		fmt.Printf("unable to read monotonic clock, ages will show as 0s: %v\n", clockErr)
 	}
-
-	mapFD, err := goebpfutils.GetMapFDFromID(mapID)
+	err := goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), mapID)
 	if err != nil {
-		return fmt.Errorf("failed to get map FD: %w", err)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("No Entries found, Empty map")
+			return nil
+		}
+		return fmt.Errorf("Unable to get First key: %v", err)
+	}
+	for {
+		iterValue := utils.ConntrackVal{}
+		err = goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), uintptr(unsafe.Pointer(&iterValue)), mapID)
+		if err != nil {
+			return fmt.Errorf("Unable to get map entry: %v", err)
+		}
+		retrievedKey := fmt.Sprintf("Conntrack Key : Source IP - %s Source port - %d Dest IP - %s Dest port - %d Protocol - %d Owner IP - %s Ifindex - %d", utils.ConvIntToIPv4(iterKey.Source_ip).String(), iterKey.Source_port, utils.ConvIntToIPv4(iterKey.Dest_ip).String(), iterKey.Dest_port, iterKey.Protocol, utils.ConvIntToIPv4(iterKey.Owner_ip).String(), iterKey.Ifindex)
+		fmt.Println(retrievedKey)
+		fmt.Println("Value : ")
+		fmt.Println("Conntrack Val - ", iterValue.Value)
+		fmt.Printf("Last Seen (ns) -  %d  (%s)\n", iterValue.LastSeen, formatLastSeen(iterValue.LastSeen, dumpNow))
+		fmt.Println("*******************************")
+
+		err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&iterKey)), uintptr(unsafe.Pointer(&iterNextKey)), mapID)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("Done reading all entries")
+			break
+		}
+		if err != nil {
+			fmt.Println("Failed to get next entry Done searching")
+			break
+		}
+		iterKey = iterNextKey
 	}
 
-	mapInfo, err := goebpfmaps.GetBPFmapInfo(mapFD)
+	return nil
+}
+
+// walkPodState walks a pod_state_map HASH map. The layout is identical for IPv4
+// and IPv6, so a single decoder serves both families.
+func walkPodState(mapID int) error {
+	var key, nextKey uint32
+	// Get the first entry
+	err := goebpfmaps.GetFirstMapEntryByID(
+		uintptr(unsafe.Pointer(&key)),
+		mapID)
 	if err != nil {
-		return fmt.Errorf("failed to get map info: %w", err)
-	}
-	unix.Close(mapFD)
-
-	switch mapInfo.Type {
-	case constdef.BPF_MAP_TYPE_LPM_TRIE.Index(),
-		constdef.BPF_MAP_TYPE_LRU_HASH.Index(),
-		constdef.BPF_MAP_TYPE_HASH.Index():
-		// Supported map types — continue
-	default:
-		return fmt.Errorf("unsupported map type: %d (expected LPM_TRIE, LRU_HASH, or HASH)", mapInfo.Type)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("No entries found, empty HASH map (pod_state_map?)")
+			return nil
+		}
+		return fmt.Errorf("unable to get first key (HASH): %v", err)
 	}
 
-	mapName := strings.TrimRight(string(mapInfo.Name[:]), "\x00")
-	fmt.Printf("Walking map: %s (type=%d, id=%d)\n", mapName, mapInfo.Type, mapID)
-
-	if mapInfo.Type == constdef.BPF_MAP_TYPE_LPM_TRIE.Index() {
-		iterKey := utils.BPFTrieKeyV6{}
-		iterNextKey := utils.BPFTrieKeyV6{}
-
-		byteSlice := utils.ConvTrieV6ToByte(iterKey)
-		nextbyteSlice := utils.ConvTrieV6ToByte(iterNextKey)
-
-		err = goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), mapID)
+	for {
+		var val PodState
+		err = goebpfmaps.GetMapEntryByID(
+			uintptr(unsafe.Pointer(&key)),
+			uintptr(unsafe.Pointer(&val)),
+			mapID)
 		if err != nil {
-			return fmt.Errorf("Unable to get First key: %v", err)
-		} else {
-			for {
-
-				iterValue := [24]utils.BPFTrieVal{}
-
-				err = goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&iterValue)), mapID)
-				if err != nil {
-					return fmt.Errorf("Unable to get map entry: %v", err)
-				} else {
-					v6key := utils.ConvByteToTrieV6(byteSlice)
-					retrievedKey := fmt.Sprintf("Key : IP/Prefixlen - %s/%d ", utils.ConvByteToIPv6(v6key.IP).String(), v6key.PrefixLen)
-					fmt.Println(retrievedKey)
-					for i := 0; i < len(iterValue); i++ {
-						if iterValue[i].Protocol == 0 {
-							continue
-						}
-						fmt.Println("-------------------")
-						fmt.Println("Value Entry : ", i)
-						fmt.Println("Protocol - ", utils.GetProtocol(int(iterValue[i].Protocol)))
-						fmt.Println("StartPort - ", iterValue[i].StartPort)
-						fmt.Println("Endport - ", iterValue[i].EndPort)
-						fmt.Println("-------------------")
-					}
-					fmt.Println("*******************************")
-				}
-
-				err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&nextbyteSlice[0])), mapID)
-				if errors.Is(err, unix.ENOENT) {
-					fmt.Println("Done reading all entries")
-					break
-				}
-				if err != nil {
-					fmt.Println("Failed to get next entry Done searching")
-					break
-				}
-				copy(byteSlice, nextbyteSlice)
-			}
+			return fmt.Errorf("unable to get HASH entry for key=%d: %v", key, err)
 		}
+
+		fmt.Println("Key : ", key)
+		fmt.Println("State - ", val.State)
+		fmt.Println("*******************************")
+
+		err = goebpfmaps.GetNextMapEntryByID(
+			uintptr(unsafe.Pointer(&key)),
+			uintptr(unsafe.Pointer(&nextKey)),
+			mapID)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("Done reading all entries in BPF_MAP_TYPE_HASH")
+			break
+		}
+		if err != nil {
+			fmt.Println("Failed to get next entry, done searching")
+			break
+		}
+		key = nextKey
 	}
 
-	if mapInfo.Type == constdef.BPF_MAP_TYPE_LRU_HASH.Index() {
-		iterKey := utils.ConntrackKeyV6{}
-		iterNextKey := utils.ConntrackKeyV6{}
+	return nil
+}
 
-		byteSlice := utils.ConvConntrackV6ToByte(iterKey)
-		nextbyteSlice := utils.ConvConntrackV6ToByte(iterNextKey)
+// walkPolicyTrieV6 walks an IPv6 policy LPM_TRIE map.
+func walkPolicyTrieV6(mapID int) error {
+	iterKey := utils.BPFTrieKeyV6{}
+	iterNextKey := utils.BPFTrieKeyV6{}
 
-		// Read once so every entry in this dump is aged against the same instant.
-		// A failure here only costs the age column, so carry on with the dump.
-		dumpNow, clockErr := utils.KtimeGetNs()
-		if clockErr != nil {
-			fmt.Printf("unable to read monotonic clock, ages will show as 0s: %v\n", clockErr)
-		}
-		err = goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), mapID)
+	byteSlice := utils.ConvTrieV6ToByte(iterKey)
+	nextbyteSlice := utils.ConvTrieV6ToByte(iterNextKey)
+
+	err := goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), mapID)
+	if err != nil {
+		return fmt.Errorf("Unable to get First key: %v", err)
+	}
+	for {
+		iterValue := [24]utils.BPFTrieVal{}
+
+		err = goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&iterValue)), mapID)
 		if err != nil {
-			return fmt.Errorf("Unable to get First key: %v", err)
-		} else {
-			for {
-				iterValue := utils.ConntrackVal{}
-				err = goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&iterValue)), mapID)
-				if err != nil {
-					return fmt.Errorf("Unable to get map entry: %v", err)
-				} else {
-					v6key := utils.ConvByteToConntrackV6(byteSlice)
-					retrievedKey := fmt.Sprintf("Conntrack Key : Source IP - %s Source port - %d Dest IP - %s Dest port - %d Protocol - %d Owner IP - %s Ifindex - %d", utils.ConvByteToIPv6(v6key.Source_ip).String(), v6key.Source_port, utils.ConvByteToIPv6(v6key.Dest_ip).String(), v6key.Dest_port, v6key.Protocol, utils.ConvByteToIPv6(v6key.Owner_ip).String(), v6key.Ifindex)
-					fmt.Println(retrievedKey)
-					fmt.Println("Value : ")
-					fmt.Println("Conntrack Val - ", iterValue.Value)
-					fmt.Printf("Last Seen (ns) -  %d  (%s)\n", iterValue.LastSeen, formatLastSeen(iterValue.LastSeen, dumpNow))
-					fmt.Println("*******************************")
-				}
-
-				err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&nextbyteSlice[0])), mapID)
-				if errors.Is(err, unix.ENOENT) {
-					fmt.Println("Done reading all entries")
-					break
-				}
-				if err != nil {
-					fmt.Println("Failed to get next entry Done searching")
-					break
-				}
-				copy(byteSlice, nextbyteSlice)
-			}
+			return fmt.Errorf("Unable to get map entry: %v", err)
 		}
+		v6key := utils.ConvByteToTrieV6(byteSlice)
+		retrievedKey := fmt.Sprintf("Key : IP/Prefixlen - %s/%d ", utils.ConvByteToIPv6(v6key.IP).String(), v6key.PrefixLen)
+		fmt.Println(retrievedKey)
+		for i := 0; i < len(iterValue); i++ {
+			if iterValue[i].Protocol == 0 {
+				continue
+			}
+			fmt.Println("-------------------")
+			fmt.Println("Value Entry : ", i)
+			fmt.Println("Protocol - ", utils.GetProtocol(int(iterValue[i].Protocol)))
+			fmt.Println("StartPort - ", iterValue[i].StartPort)
+			fmt.Println("Endport - ", iterValue[i].EndPort)
+			fmt.Println("-------------------")
+		}
+		fmt.Println("*******************************")
+
+		err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&nextbyteSlice[0])), mapID)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("Done reading all entries")
+			break
+		}
+		if err != nil {
+			fmt.Println("Failed to get next entry Done searching")
+			break
+		}
+		copy(byteSlice, nextbyteSlice)
+	}
+
+	return nil
+}
+
+// walkConntrackV6 walks an IPv6 conntrack LRU_HASH map.
+func walkConntrackV6(mapID int) error {
+	iterKey := utils.ConntrackKeyV6{}
+	iterNextKey := utils.ConntrackKeyV6{}
+
+	byteSlice := utils.ConvConntrackV6ToByte(iterKey)
+	nextbyteSlice := utils.ConvConntrackV6ToByte(iterNextKey)
+
+	// Read once so every entry in this dump is aged against the same instant.
+	// A failure here only costs the age column, so carry on with the dump.
+	dumpNow, clockErr := utils.KtimeGetNs()
+	if clockErr != nil {
+		fmt.Printf("unable to read monotonic clock, ages will show as 0s: %v\n", clockErr)
+	}
+	err := goebpfmaps.GetFirstMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), mapID)
+	if err != nil {
+		return fmt.Errorf("Unable to get First key: %v", err)
+	}
+	for {
+		iterValue := utils.ConntrackVal{}
+		err = goebpfmaps.GetMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&iterValue)), mapID)
+		if err != nil {
+			return fmt.Errorf("Unable to get map entry: %v", err)
+		}
+		v6key := utils.ConvByteToConntrackV6(byteSlice)
+		retrievedKey := fmt.Sprintf("Conntrack Key : Source IP - %s Source port - %d Dest IP - %s Dest port - %d Protocol - %d Owner IP - %s Ifindex - %d", utils.ConvByteToIPv6(v6key.Source_ip).String(), v6key.Source_port, utils.ConvByteToIPv6(v6key.Dest_ip).String(), v6key.Dest_port, v6key.Protocol, utils.ConvByteToIPv6(v6key.Owner_ip).String(), v6key.Ifindex)
+		fmt.Println(retrievedKey)
+		fmt.Println("Value : ")
+		fmt.Println("Conntrack Val - ", iterValue.Value)
+		fmt.Printf("Last Seen (ns) -  %d  (%s)\n", iterValue.LastSeen, formatLastSeen(iterValue.LastSeen, dumpNow))
+		fmt.Println("*******************************")
+
+		err = goebpfmaps.GetNextMapEntryByID(uintptr(unsafe.Pointer(&byteSlice[0])), uintptr(unsafe.Pointer(&nextbyteSlice[0])), mapID)
+		if errors.Is(err, unix.ENOENT) {
+			fmt.Println("Done reading all entries")
+			break
+		}
+		if err != nil {
+			fmt.Println("Failed to get next entry Done searching")
+			break
+		}
+		copy(byteSlice, nextbyteSlice)
 	}
 
 	return nil

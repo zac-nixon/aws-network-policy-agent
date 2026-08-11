@@ -51,7 +51,6 @@ FROM ${base_image}
 WORKDIR /
 COPY --from=builder /workspace/controller .
 COPY --from=builder /workspace/aws-eks-na-cli .
-COPY --from=builder /workspace/aws-eks-na-cli-v6 .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v4ingress.bpf.o .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v4egress.bpf.o .
 COPY --from=bpfbuilder /bpfbuilder/pkg/ebpf/c/tc.v6ingress.bpf.o .

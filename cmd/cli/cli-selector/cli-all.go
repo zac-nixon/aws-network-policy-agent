@@ -64,7 +64,7 @@ var mapWalkCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		mapID := args[0]
 		strMapID, _ := strconv.Atoi(mapID)
-		err := clihelper.MapWalk(strMapID, "")
+		err := clihelper.MapWalkAuto(strMapID)
 		if err != nil {
 			fmt.Println("Failed to execute the cmd - ", err)
 		}

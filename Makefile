@@ -122,7 +122,6 @@ build-linux: BUILD_FLAGS = $(BUILD_MODE) -ldflags '-s -w $(LDFLAGS) $(VERSION_LD
 build-linux: ## Build the controllerusing the host's Go toolchain.
 	$(GO_ENV_EBPF) go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -tags netgo,ebpf,core -a -o controller main.go
 	go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -o aws-eks-na-cli ./cmd/cli
-	go build $(VENDOR_OVERRIDE_FLAG) $(BUILD_FLAGS) -o aws-eks-na-cli-v6 ./cmd/cliv6
 
 
 CMD_MKDIR ?= mkdir
@@ -340,7 +339,6 @@ deploy-network-policy-controller-on-dataplane: ## This uses the script from amaz
 
 clean: # Clean temporary files and build artifacts from the project
 	@rm -f -- aws-eks-na-cli
-	@rm -f -- aws-eks-na-cli-v6
 	@rm -f -- coverage.txt
 
 build-test-binaries: # Builds the test suite binaries (excludes soak tests; see build-soak-test-binaries)

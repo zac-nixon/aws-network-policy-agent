@@ -1,4 +1,4 @@
-package cli
+package cliv6
 
 import (
 	"fmt"
@@ -64,22 +64,7 @@ var mapWalkCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		mapID := args[0]
 		strMapID, _ := strconv.Atoi(mapID)
-		err := clihelper.MapWalk(strMapID, "")
-		if err != nil {
-			fmt.Println("Failed to execute the cmd - ", err)
-		}
-	},
-}
-
-var mapWalkCPCmd = &cobra.Command{
-	Use:     "dump-cp-maps",
-	Aliases: []string{"dcp"},
-	Short:   "Dump all ebpf maps related data",
-	Args:    cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		mapID := args[0]
-		strMapID, _ := strconv.Atoi(mapID)
-		err := clihelper.MapWalkCP(strMapID)
+		err := clihelper.MapWalkv6(strMapID)
 		if err != nil {
 			fmt.Println("Failed to execute the cmd - ", err)
 		}
@@ -92,5 +77,4 @@ func init() {
 	subCmd.AddCommand(mapCmd)
 	subCmd.AddCommand(ebpfdataCmd)
 	subCmd.AddCommand(mapWalkCmd)
-	subCmd.AddCommand(mapWalkCPCmd)
 }

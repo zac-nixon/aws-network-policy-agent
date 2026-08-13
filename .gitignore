@@ -3,6 +3,7 @@ coverage.txt
 *.h
 *.o
 aws-eks-na-cli
+aws-eks-na-cli-v6
 controller
 bin/
 config/

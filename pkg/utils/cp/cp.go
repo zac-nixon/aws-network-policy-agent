@@ -9,7 +9,8 @@ import (
 )
 
 var (
-	EKS_CLI_BINARY = "aws-eks-na-cli"
+	EKS_CLI_BINARY    = "aws-eks-na-cli"
+	EKS_V6_CLI_BINARY = "aws-eks-na-cli-v6"
 )
 
 func log() logger.Logger {
@@ -68,6 +69,11 @@ func InstallBPFBinaries(pluginBins []string, hostCNIBinPath string) error {
 	log().Info("Let's install BPF Binaries on to the host path.....")
 	for _, plugin := range pluginBins {
 		targetPlugin := plugin
+
+		// CLI binary should always refer to aws-eks-na-cli
+		if plugin == EKS_V6_CLI_BINARY {
+			targetPlugin = EKS_CLI_BINARY
+		}
 
 		target := fmt.Sprintf("%s%s", hostCNIBinPath, targetPlugin)
 		source := fmt.Sprintf("%s", plugin)

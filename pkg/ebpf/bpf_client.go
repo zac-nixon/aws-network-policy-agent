@@ -40,6 +40,7 @@ var (
 	AWS_CONNTRACK_MAP                                = "aws_conntrack_map"
 	AWS_EVENTS_MAP                                   = "policy_events"
 	EKS_CLI_BINARY                                   = "aws-eks-na-cli"
+	EKS_V6_CLI_BINARY                                = "aws-eks-na-cli-v6"
 	hostBinaryPath                                   = "/host/opt/cni/bin/"
 	IPv4_HOST_MASK                                   = "/32"
 	IPv6_HOST_MASK                                   = "/128"
@@ -142,10 +143,8 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 	ingressBinary, egressBinary, eventsBinary,
 		cliBinary, hostMask := TC_INGRESS_BINARY, TC_EGRESS_BINARY, EVENTS_BINARY, EKS_CLI_BINARY, IPv4_HOST_MASK
 	if enableIPv6 {
-		// The CLI binary is family-agnostic (it auto-detects IPv4/IPv6 from the
-		// map key size), so cliBinary stays EKS_CLI_BINARY for both families.
 		ingressBinary, egressBinary, eventsBinary,
-			hostMask = TC_V6_INGRESS_BINARY, TC_V6_EGRESS_BINARY, EVENTS_V6_BINARY, IPv6_HOST_MASK
+			cliBinary, hostMask = TC_V6_INGRESS_BINARY, TC_V6_EGRESS_BINARY, EVENTS_V6_BINARY, EKS_V6_CLI_BINARY, IPv6_HOST_MASK
 	}
 	ebpfClient.ingressBinary, ebpfClient.egressBinary,
 		ebpfClient.hostMask = ingressBinary, egressBinary, hostMask
@@ -192,9 +191,8 @@ func NewBpfClient(ctx context.Context, nodeIP string, enablePolicyEventLogs, ena
 		//Log the error and move on
 		log().Errorf("Failed to recover the BPF state error: %v", err)
 		sdkAPIErr.WithLabelValues("RecoverBPFState").Inc()
-	} else {
-		log().Info("Successfully recovered BPF state")
 	}
+	log().Info("Successfully recovered BPF state")
 	ebpfClient.interfaceNametoIngressPinPath = interfaceNametoIngressPinPath
 	ebpfClient.interfaceNametoEgressPinPath = interfaceNametoEgressPinPath
 
@@ -347,7 +345,7 @@ func checkAndUpdateBPFBinaries(bpfTCClient tc.BpfTc, bpfBinaries []string, hostB
 	var existingProbePath string
 
 	for _, bpfProbe := range bpfBinaries {
-		if bpfProbe == EKS_CLI_BINARY {
+		if bpfProbe == EKS_CLI_BINARY || bpfProbe == EKS_V6_CLI_BINARY {
 			continue
 		}
 

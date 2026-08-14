@@ -2,6 +2,7 @@ package leak
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,22 +19,68 @@ import (
 )
 
 const (
-	churnDuration = 20 * time.Minute
-	cronSchedule  = "*/1 * * * *" // every minute
-	podsPerJob    = 100
-	pollInterval  = 10 * time.Second
-	cronJobName   = "churn-generator"
+	// churnCycles is the number of churn-then-drain iterations. A leak is
+	// detected as a resource baseline that fails to recover after drain, and/or
+	// that drifts upward cycle-over-cycle — so more than one cycle is required.
+	churnCycles = 3
+
+	// jobsPerCycle is the number of DISTINCT single-completion Jobs launched per
+	// cycle. Each Job has a unique name, which (because GetPodIdentifier strips
+	// the last "-" segment of the pod name) yields a UNIQUE podIdentifier per
+	// pod and therefore a unique, un-shared eBPF program. This defeats the
+	// "sibling rescue" that masked the leak when 100 pods shared one identifier:
+	// with no sibling to reclaim it, a single partial-attach failure leaves a
+	// durable orphaned program + FDs.
+	jobsPerCycle = 80
+
+	churnLabelKey = "app"
+	churnLabelVal = "churn-pod"
+
+	drainTimeout     = 6 * time.Minute
+	settleAfterDrain = 90 * time.Second // allow CNI DEL + reconcile + prog cleanup to settle
+	inspectorTimeout = 3 * time.Minute
+
+	// fdTolerance absorbs benign, transient reconcile state. Any real leak grows
+	// without bound across cycles and blows well past this.
+	fdTolerance = 6
+
+	inspectorImage = "public.ecr.aws/amazonlinux/amazonlinux:2023"
+	churnImage     = "public.ecr.aws/amazonlinux/amazonlinux:2023-minimal"
 )
+
+// fdScanScript finds the network policy agent process (ENTRYPOINT "/controller")
+// via the shared host PID namespace and reports its open-FD counts. BPF_FD counts
+// only bpf-prog / bpf-map file descriptors, which is the resource this leak
+// actually exhausts, so it is the most direct black-box signal.
+const fdScanScript = `
+PID=""
+for c in /proc/[0-9]*/cmdline; do
+  first=$(tr '\0' '\n' < "$c" 2>/dev/null | head -n1)
+  if [ "$first" = "/controller" ]; then
+    PID=$(echo "$c" | sed 's#/proc/##; s#/cmdline##')
+    break
+  fi
+done
+if [ -z "$PID" ]; then echo "PID_NOT_FOUND"; exit 0; fi
+TOTAL=$(ls /proc/$PID/fd 2>/dev/null | wc -l)
+BPF=$(ls -l /proc/$PID/fd 2>/dev/null | grep -c 'bpf-prog\|bpf-map')
+echo "PID=$PID TOTAL_FD=$TOTAL BPF_FD=$BPF"
+`
+
+type nodeBaseline struct {
+	bpfFD     int
+	churnPins int
+}
 
 var _ = Describe("BPF Probe Leak Under Pod Churn", Ordered, func() {
 	var (
 		networkPolicy     *network.NetworkPolicy
 		defaultDenyPolicy *network.NetworkPolicy
-		cronJob           *batchv1.CronJob
 		workerNodes       []v1.Node
+		inspectorByNode   = map[string]string{} // nodeName -> inspector pod name
 	)
 
-	It("should not leak BPF progs/maps after high pod churn with network policy", func() {
+	It("should not leak BPF programs/FDs across repeated pod churn cycles", func() {
 		By("Getting worker nodes and labeling them for churn scheduling")
 		var err error
 		workerNodes, err = getWorkerNodes()
@@ -41,61 +88,91 @@ var _ = Describe("BPF Probe Leak Under Pod Churn", Ordered, func() {
 		Expect(len(workerNodes)).To(BeNumerically(">=", 1))
 		lo.ForEach(workerNodes, func(node v1.Node, _ int) {
 			node.Labels["test-node"] = "true"
-			err = fw.K8sClient.Update(ctx, &node)
-			Expect(err).ToNot(HaveOccurred())
+			Expect(fw.K8sClient.Update(ctx, &node)).ToNot(HaveOccurred())
 		})
 
-		By("Creating a default deny network policy")
+		By("Applying default-deny + churn-pod network policies to force probe attachment")
 		defaultDenyPolicy = buildDefaultDenyNetworkPolicy()
-		err = fw.NetworkPolicyManager.CreateNetworkPolicy(ctx, defaultDenyPolicy)
-		Expect(err).ToNot(HaveOccurred())
+		Expect(fw.NetworkPolicyManager.CreateNetworkPolicy(ctx, defaultDenyPolicy)).ToNot(HaveOccurred())
 
-		By("Creating a network policy targeting churn pods")
 		networkPolicy = buildChurnNetworkPolicy()
-		err = fw.NetworkPolicyManager.CreateNetworkPolicy(ctx, networkPolicy)
-		Expect(err).ToNot(HaveOccurred())
+		Expect(fw.NetworkPolicyManager.CreateNetworkPolicy(ctx, networkPolicy)).ToNot(HaveOccurred())
 
-		By("Creating a CronJob that spawns 100 short-lived pods per minute")
-		cronJob = buildChurnCronJob()
-		err = fw.K8sClient.Create(ctx, cronJob)
-		Expect(err).ToNot(HaveOccurred())
-
-		By(fmt.Sprintf("Waiting %v for pod churn to complete", churnDuration))
-		// if no successful run of job in 3 minutes we will bail.
-		waitForChurnOrBail(3 * time.Minute)
-
-		By("Deleting the CronJob and waiting for pods to terminate")
-		err = fw.K8sClient.Delete(ctx, cronJob)
-		Expect(err).ToNot(HaveOccurred())
-		// Wait for all churn pods to terminate
-		time.Sleep(2 * time.Minute)
-
-		By("Deploying node-shell check pods on each node to verify no leaked BPF state")
+		By("Deploying a privileged hostPID inspector pod on each node")
 		for _, node := range workerNodes {
-			checkPodName := fmt.Sprintf("leak-check-%s", node.Name)
-			checkPod := buildNodeCheckPod(checkPodName, node.Name)
-
-			_, err := fw.PodManager.CreateAndWaitTillPodIsRunning(ctx, checkPod, 2*time.Minute)
+			name := fmt.Sprintf("leak-inspector-%s", randSuffix(6))
+			pod := buildInspectorPod(name, node.Name)
+			_, err := fw.PodManager.CreateAndWaitTillPodIsRunning(ctx, pod, inspectorTimeout)
 			Expect(err).ToNot(HaveOccurred())
-			DeferCleanup(func() {
-				fw.PodManager.DeleteAndWaitTillPodIsDeleted(ctx, checkPod)
-			})
+			inspectorByNode[node.Name] = name
+			p := pod
+			DeferCleanup(func() { fw.PodManager.DeleteAndWaitTillPodIsDeleted(ctx, p) })
+		}
 
-			By(fmt.Sprintf("Checking BPF maps on node %s", node.Name))
-			mapsOutput, err := fw.PodManager.ExecInPod(namespace, checkPodName,
-				[]string{"chroot", "/host", "/opt/cni/bin/aws-eks-na-cli", "ebpf", "loaded-ebpfdata"})
-			Expect(err).ToNot(HaveOccurred())
+		By("Recording resource baseline before any churn")
+		baseline := map[string]nodeBaseline{}
+		for node, insp := range inspectorByNode {
+			bpfFD := readControllerBpfFdCount(insp)
+			pins := countChurnPins(insp)
+			baseline[node] = nodeBaseline{bpfFD: bpfFD, churnPins: pins}
+			By(fmt.Sprintf("baseline node=%s bpfFD=%d churnPins=%d", node, bpfFD, pins))
+			// No churn workload has run yet, so there must be zero churn pins.
+			Expect(pins).To(Equal(0), "unexpected pre-existing churn artifacts on %s", node)
+		}
 
-			// No churn pod BPF artifacts should remain
-			// Only system pods (coredns, aws-node, etc.) should have pinned progs/maps
-			assertNoChurnPodLeaks(mapsOutput, node.Name)
+		for cycle := 1; cycle <= churnCycles; cycle++ {
+			By(fmt.Sprintf("=== Churn cycle %d/%d: launching %d unique-identifier Jobs ===",
+				cycle, churnCycles, jobsPerCycle))
+
+			jobs := make([]*batchv1.Job, 0, jobsPerCycle)
+			for i := 0; i < jobsPerCycle; i++ {
+				// Unique job name -> unique podIdentifier (no sibling rescue).
+				jobName := fmt.Sprintf("churn-c%d-%d-%s", cycle, i, randSuffix(5))
+				// Vary the lifetime (0/1/2s) so some pods are torn down mid-attach
+				// (partial-attach race) and some right after — maximizing the
+				// probability of hitting the leak window.
+				job := buildChurnLeakJob(jobName, i%3)
+				Expect(fw.K8sClient.Create(ctx, job)).ToNot(HaveOccurred())
+				jobs = append(jobs, job)
+			}
+
+			By("Waiting for churn pods to drain")
+			waitForChurnDrain()
+
+			By("Deleting churn Jobs and letting cleanup settle")
+			for _, j := range jobs {
+				bg := metav1.DeletePropagationBackground
+				_ = fw.K8sClient.Delete(ctx, j, &client.DeleteOptions{PropagationPolicy: &bg})
+			}
+			waitForChurnDrain()
+			time.Sleep(settleAfterDrain)
+
+			By(fmt.Sprintf("Sampling resources after cycle %d drain", cycle))
+			for node, insp := range inspectorByNode {
+				bpfFD := readControllerBpfFdCount(insp)
+				pins := countChurnPins(insp)
+				base := baseline[node]
+				By(fmt.Sprintf("cycle=%d node=%s bpfFD=%d (baseline %d) churnPins=%d",
+					cycle, node, bpfFD, base.bpfFD, pins))
+
+				// Precise signal: with unique identifiers there is no sibling to
+				// reclaim a leaked program, so ANY surviving churn pin after a
+				// full drain is a genuine leak.
+				Expect(pins).To(Equal(0),
+					"LEAK: %d orphaned churn-pod BPF program(s) still pinned on node %s after cycle %d drain",
+					pins, node, cycle)
+
+				// Direct FD signal: the agent's bpf-prog/bpf-map FD count must
+				// return to (approximately) its pre-churn baseline once pods drain.
+				Expect(bpfFD).To(BeNumerically("<=", base.bpfFD+fdTolerance),
+					"LEAK: agent BPF FD count on node %s did not recover after cycle %d "+
+						"(got %d, baseline %d, tolerance %d)",
+					node, cycle, bpfFD, base.bpfFD, fdTolerance)
+			}
 		}
 	})
 
 	AfterAll(func() {
-		if cronJob != nil {
-			fw.K8sClient.Delete(ctx, cronJob)
-		}
 		if networkPolicy != nil {
 			fw.NetworkPolicyManager.DeleteNetworkPolicy(ctx, networkPolicy)
 		}
@@ -118,58 +195,66 @@ func buildDefaultDenyNetworkPolicy() *network.NetworkPolicy {
 }
 
 func buildChurnNetworkPolicy() *network.NetworkPolicy {
-	// Deny all ingress and egress for churn pods — forces eBPF probe attachment
+	// Deny all ingress and egress for churn pods — forces eBPF probe attachment.
 	return manifest.NewNetworkPolicyBuilder().
 		Namespace(namespace).
 		Name("churn-pod-policy").
-		PodSelector("app", "churn-pod").
+		PodSelector(churnLabelKey, churnLabelVal).
 		SetPolicyType(true, true).
 		Build()
 }
 
-func buildChurnCronJob() *batchv1.CronJob {
-	parallelism := int32(podsPerJob)
-	completions := int32(podsPerJob)
-	backoffLimit := int32(0)
-	ttl := int32(30) // cleanup finished jobs after 30s
-	successfulJobsHistory := int32(0)
-	failedJobsHistory := int32(1)
+// getWorkerNodes returns the Linux AL2023 worker nodes used for churn.
+func getWorkerNodes() ([]v1.Node, error) {
+	nodeList := &v1.NodeList{}
+	err := fw.K8sClient.List(ctx, nodeList, client.MatchingLabels{
+		"kubernetes.io/os": "linux",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lo.Filter(nodeList.Items, func(node v1.Node, index int) bool {
+		return strings.Contains(node.Status.NodeInfo.OSImage, "Amazon Linux 2023")
+	}), nil
+}
 
-	return &batchv1.CronJob{
+// buildChurnLeakJob builds a single-completion Job whose pod dies quickly. The
+// unique job name yields a unique podIdentifier (no sibling rescue). sleepSeconds
+// varies the pod lifetime to spread coverage across the attach window.
+func buildChurnLeakJob(name string, sleepSeconds int) *batchv1.Job {
+	completions := int32(1)
+	parallelism := int32(1)
+	backoffLimit := int32(0)
+	ttl := int32(15)
+	grace := int64(0)
+
+	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cronJobName,
+			Name:      name,
 			Namespace: namespace,
 		},
-		Spec: batchv1.CronJobSpec{
-			Schedule:                   cronSchedule,
-			SuccessfulJobsHistoryLimit: &successfulJobsHistory,
-			FailedJobsHistoryLimit:     &failedJobsHistory,
-			JobTemplate: batchv1.JobTemplateSpec{
-				Spec: batchv1.JobSpec{
-					Parallelism:             &parallelism,
-					Completions:             &completions,
-					BackoffLimit:            &backoffLimit,
-					TTLSecondsAfterFinished: &ttl,
-					Template: v1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{
-							Labels: map[string]string{"app": "churn-pod"},
-						},
-						Spec: v1.PodSpec{
-							NodeSelector: map[string]string{
-								"test-node": "true",
-							},
-							RestartPolicy: v1.RestartPolicyNever,
-							Containers: []v1.Container{
-								{
-									Name:    "churn",
-									Image:   "public.ecr.aws/amazonlinux/amazonlinux:2023-minimal",
-									Command: []string{"sleep", "5"},
-									Resources: v1.ResourceRequirements{
-										Requests: v1.ResourceList{
-											v1.ResourceCPU:    resource.MustParse("1m"),
-											v1.ResourceMemory: resource.MustParse("4Mi"),
-										},
-									},
+		Spec: batchv1.JobSpec{
+			Completions:             &completions,
+			Parallelism:             &parallelism,
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &ttl,
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{churnLabelKey: churnLabelVal},
+				},
+				Spec: v1.PodSpec{
+					NodeSelector:                  map[string]string{"test-node": "true"},
+					RestartPolicy:                 v1.RestartPolicyNever,
+					TerminationGracePeriodSeconds: &grace,
+					Containers: []v1.Container{
+						{
+							Name:    "churn",
+							Image:   churnImage,
+							Command: []string{"sleep", strconv.Itoa(sleepSeconds)},
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("1m"),
+									v1.ResourceMemory: resource.MustParse("4Mi"),
 								},
 							},
 						},
@@ -180,7 +265,10 @@ func buildChurnCronJob() *batchv1.CronJob {
 	}
 }
 
-func buildNodeCheckPod(name, nodeName string) *v1.Pod {
+// buildInspectorPod builds a long-lived privileged pod that shares the host PID
+// namespace and mounts the host root, so it can read /proc/<agent-pid>/fd and run
+// the on-host aws-eks-na-cli via chroot.
+func buildInspectorPod(name, nodeName string) *v1.Pod {
 	privileged := true
 	hostPathDir := v1.HostPathDirectory
 	return &v1.Pod{
@@ -195,18 +283,12 @@ func buildNodeCheckPod(name, nodeName string) *v1.Pod {
 			RestartPolicy: v1.RestartPolicyNever,
 			Containers: []v1.Container{
 				{
-					Name:    "check",
-					Image:   "public.ecr.aws/amazonlinux/amazonlinux:2023-minimal",
-					Command: []string{"sleep", "3600"},
-					SecurityContext: &v1.SecurityContext{
-						Privileged: &privileged,
-					},
+					Name:            "inspector",
+					Image:           inspectorImage,
+					Command:         []string{"sleep", "7200"},
+					SecurityContext: &v1.SecurityContext{Privileged: &privileged},
 					VolumeMounts: []v1.VolumeMount{
-						{
-							Name:      "host-root",
-							MountPath: "/host",
-							ReadOnly:  true,
-						},
+						{Name: "host-root", MountPath: "/host", ReadOnly: true},
 					},
 				},
 			},
@@ -214,10 +296,7 @@ func buildNodeCheckPod(name, nodeName string) *v1.Pod {
 				{
 					Name: "host-root",
 					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: "/",
-							Type: &hostPathDir,
-						},
+						HostPath: &v1.HostPathVolumeSource{Path: "/", Type: &hostPathDir},
 					},
 				},
 			},
@@ -225,52 +304,54 @@ func buildNodeCheckPod(name, nodeName string) *v1.Pod {
 	}
 }
 
-func getWorkerNodes() ([]v1.Node, error) {
-	nodeList := &v1.NodeList{}
-	err := fw.K8sClient.List(ctx, nodeList, client.MatchingLabels{
-		"kubernetes.io/os": "linux",
-	})
-	if err != nil {
-		return nil, err
-	}
-	return lo.Filter(nodeList.Items, func(node v1.Node, index int) bool {
-		return strings.Contains(node.Status.NodeInfo.OSImage, "Amazon Linux 2023")
-	}), nil
+// readControllerBpfFdCount execs the FD scan in the inspector pod and returns the
+// agent's bpf-prog/bpf-map FD count.
+func readControllerBpfFdCount(inspectorPod string) int {
+	out, err := fw.PodManager.ExecInPod(namespace, inspectorPod, []string{"sh", "-c", fdScanScript})
+	Expect(err).ToNot(HaveOccurred())
+	Expect(out).ToNot(ContainSubstring("PID_NOT_FOUND"),
+		"could not locate /controller agent process from inspector pod")
+	return parseIntToken(out, "BPF_FD=")
 }
 
-// assertNoChurnPodLeaks checks that no BPF artifacts from churn pods remain.
-// Churn pods have identifier containing "churn-generator" in their BPF pin paths.
-func assertNoChurnPodLeaks(output, nodeName string) {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+// countChurnPins returns the number of pinned BPF programs whose pin path belongs
+// to a churn pod (identifier prefixed with "churn-c"). With unique identifiers a
+// nonzero count after drain is a genuine orphaned program.
+func countChurnPins(inspectorPod string) int {
+	out, err := fw.PodManager.ExecInPod(namespace, inspectorPod,
+		[]string{"chroot", "/host", "/opt/cni/bin/aws-eks-na-cli", "ebpf", "loaded-ebpfdata"})
+	Expect(err).ToNot(HaveOccurred())
+
+	count := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "PinPath:") && strings.Contains(line, "churn-c") {
+			count++
 		}
-		Expect(line).ToNot(ContainSubstring(cronJobName),
-			fmt.Sprintf("Leaked BPF artifact found on node %s: %s", nodeName, line))
 	}
+	return count
 }
 
-func waitForChurnOrBail(jobStuckTimeout time.Duration) {
-	deadline := time.Now().Add(churnDuration)
-	start := time.Now()
-	for time.Now().Before(deadline) {
-		time.Sleep(pollInterval)
-
-		cj := &batchv1.CronJob{}
-		Expect(fw.K8sClient.Get(ctx, client.ObjectKey{
-			Name:      cronJobName,
-			Namespace: namespace,
-		}, cj)).ToNot(HaveOccurred())
-
-		if cj.Status.LastSuccessfulTime != nil {
-			if time.Since(cj.Status.LastSuccessfulTime.Time) > jobStuckTimeout {
-				Fail(fmt.Sprintf("CronJob last succeeded %v ago, stuck for > %v, bailing early",
-					time.Since(cj.Status.LastSuccessfulTime.Time), jobStuckTimeout))
-			}
-			continue
-		} else if time.Since(start) > jobStuckTimeout {
-			Fail(fmt.Sprintf("CronJob has never succeeded after %v, bailing early", jobStuckTimeout))
+// waitForChurnDrain blocks until no churn-pod remains in the namespace.
+func waitForChurnDrain() {
+	Eventually(func() int {
+		pods, err := fw.PodManager.GetPodsWithLabel(ctx, namespace, churnLabelKey, churnLabelVal)
+		if err != nil {
+			return -1
 		}
+		return len(pods)
+	}, drainTimeout, 5*time.Second).Should(Equal(0), "churn pods failed to drain")
+}
+
+// parseIntToken extracts the integer following `token` (e.g. "BPF_FD=") in s.
+func parseIntToken(s, token string) int {
+	idx := strings.Index(s, token)
+	Expect(idx).To(BeNumerically(">=", 0), "token %q not found in output: %s", token, s)
+	rest := s[idx+len(token):]
+	end := strings.IndexAny(rest, " \n\t")
+	if end >= 0 {
+		rest = rest[:end]
 	}
+	n, err := strconv.Atoi(strings.TrimSpace(rest))
+	Expect(err).ToNot(HaveOccurred(), "failed to parse int from %q", rest)
+	return n
 }

@@ -24,7 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	// "unsafe"
+	"unsafe"
 )
 
 func TestBpfClient_IsEBPFProbeAttached(t *testing.T) {
@@ -1206,4 +1206,175 @@ func TestCleanupDeletedPodsIfNeeded(t *testing.T) {
 		return true
 	})
 	assert.Equal(t, 400, remaining)
+}
+
+// TestAttacheBPFProbes_PartialAttachLeaksProgram is a deterministic, unit-level
+// reproduction of the BPFProbeLeakOnPodChurn leak that the integration test is
+// unable to reliably trip.
+//
+// Scenario (a short-lived churn pod under a default-deny policy):
+//  1. The ingress probe loads + pins its program and attaches successfully
+//     (ingress attach goes through TCEgressAttach in the SDK).
+//  2. The egress probe attach then fails because the pod's hostVeth has already
+//     vanished as the pod is torn down (egress attach goes through
+//     TCIngressAttach). By this point the egress program is ALSO already
+//     loaded + pinned, and its FD is held in policyEndpointeBPFContext.
+//  3. AttacheBPFProbes returns the error BEFORE reaching the block that
+//     registers the pod in ingressPodToProgMap / egressPodToProgMap.
+//
+// Later, when the pod is deleted, DeleteBPFProbes calls isProgFdShared which
+// returns an error (the pod was never registered). The guard
+// `if err == nil && !isProgFdShared` is therefore false, so deleteBPFProbes is
+// never called and the pinned programs / open FDs are orphaned.
+//
+// The test asserts the desired leak-free invariant, so it FAILS against the
+// current code — proving the leak is real. Once AttacheBPFProbes rolls back a
+// partial attach (or DeleteBPFProbes reclaims on the isProgFdShared error path),
+// this test turns green.
+func TestAttacheBPFProbes_PartialAttachLeaksProgram(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	pod := types.NamespacedName{Name: "churn-pod-abc", Namespace: "default"}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	podNamespacedName := utils.GetPodNamespacedName(pod.Name, pod.Namespace)
+
+	ingressPinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "ingress")
+	egressPinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "egress")
+
+	const ingressBinary = "tc.v4ingress.bpf.o"
+	const egressBinary = "tc.v4egress.bpf.o"
+
+	// Both directions load + pin successfully; the failure happens at TC attach.
+	mockBpfSDK := mock_bpfclient.NewMockBpfSDKClient(ctrl)
+	mockBpfSDK.EXPECT().LoadBpfFile(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(fileName string, podID string) (map[string]goelf.BpfData, map[string]goebpfmaps.BpfMap, error) {
+			if fileName == egressBinary {
+				return map[string]goelf.BpfData{
+					egressPinPath: {
+						Program: goebpfprogs.BpfProgram{ProgID: 4, ProgFD: 11},
+						Maps: map[string]goebpfmaps.BpfMap{
+							utils.TC_EGRESS_MAP:           {MapFD: 110},
+							utils.TC_EGRESS_POD_STATE_MAP: {MapFD: 111},
+						},
+					},
+				}, map[string]goebpfmaps.BpfMap{}, nil
+			}
+			return map[string]goelf.BpfData{
+				ingressPinPath: {
+					Program: goebpfprogs.BpfProgram{ProgID: 2, ProgFD: 10},
+					Maps: map[string]goebpfmaps.BpfMap{
+						utils.TC_INGRESS_MAP:           {MapFD: 100},
+						utils.TC_INGRESS_POD_STATE_MAP: {MapFD: 101},
+					},
+				},
+			}, map[string]goebpfmaps.BpfMap{}, nil
+		},
+	).AnyTimes()
+
+	mockTCClient := mock_tc.NewMockBpfTc(ctrl)
+	// Ingress probe attaches via TCEgressAttach -> succeeds.
+	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	// Egress probe attaches via TCIngressAttach -> fails: hostVeth gone under churn.
+	mockTCClient.EXPECT().TCIngressAttach(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(errors.New("cannot find device: hostVeth vanished during pod teardown")).AnyTimes()
+
+	testBpfClient := &bpfClient{
+		hostMask:                  "/32",
+		policyEndpointeBPFContext: new(sync.Map),
+		bpfSDKClient:              mockBpfSDK,
+		bpfTCClient:               mockTCClient,
+		ingressPodToProgMap:       new(sync.Map),
+		egressPodToProgMap:        new(sync.Map),
+		ingressProgToPodsMap:      new(sync.Map),
+		egressProgToPodsMap:       new(sync.Map),
+		podIdentifierLock:         new(sync.Map),
+		deletedPods:               new(sync.Map),
+		ingressBinary:             ingressBinary,
+		egressBinary:              egressBinary,
+	}
+
+	utils.GetHostVethName = func(_, _ string, _ int, _ []string) (string, error) {
+		return "mockedveth0", nil
+	}
+
+	// Step 1+2: attach fails on the egress direction after ingress (and egress)
+	// programs are already loaded + pinned.
+	err := testBpfClient.AttacheBPFProbes(pod, podIdentifier, 1)
+	assert.Error(t, err, "expected partial attach to fail on the egress direction")
+
+	// Sanity: the programs were loaded and pinned, so their FDs are held in
+	// policyEndpointeBPFContext. This is the resource that must be reclaimed.
+	_, ctxExistsAfterAttach := testBpfClient.policyEndpointeBPFContext.Load(podIdentifier)
+	assert.True(t, ctxExistsAfterAttach,
+		"sanity: a program should have been loaded+pinned before the attach failed")
+
+	// Step 3: the pod is deleted (CNI DEL / short-lived pod completes).
+	err = testBpfClient.DeleteBPFProbes(pod, podIdentifier)
+	assert.NoError(t, err)
+
+	// INVARIANT (leak-free): once the pod is gone, the loaded/pinned program
+	// context must be released. On the current code this assertion FAILS —
+	// DeleteBPFProbes bails out because isProgFdShared errors for an
+	// unregistered pod, so the pinned programs / open FDs are orphaned.
+	_, ctxLeaked := testBpfClient.policyEndpointeBPFContext.Load(podIdentifier)
+	assert.False(t, ctxLeaked,
+		"LEAK: BPF program context for podIdentifier %q was never released after the pod "+
+			"was deleted; pinned programs and their FDs are orphaned (BPFProbeLeakOnPodChurn)",
+		podIdentifier)
+
+	// Mechanism check: the pod was never registered in the refcount maps, which
+	// is precisely why DeleteBPFProbes cannot reclaim the program.
+	_, ingressRegistered := testBpfClient.ingressPodToProgMap.Load(podNamespacedName)
+	_, egressRegistered := testBpfClient.egressPodToProgMap.Load(podNamespacedName)
+	t.Logf("post-failure registration state: ingressRegistered=%v egressRegistered=%v (both false explains the leak)",
+		ingressRegistered, egressRegistered)
+}
+
+// TestUpdatePodStateEbpfMaps_ResolvesFromPinPathNotCachedFD guards the root-cause fix for the
+// pod_state stale-FD ingress blackhole.
+//
+// Root cause: the agent used a cached raw map FD as the map's identity. After a program reload
+// the kernel recycles fd numbers (lowest-free-first), so a cached FD can come to refer to a
+// different bpf map (silent wrong write), a non-map object (EINVAL), or a closed fd (EBADF). The
+// write then never lands in the real pod_state map and the datapath fail-closes (BPF_DROP),
+// ingress-blackholing every pod sharing the podIdentifier until restart.
+//
+// Fix: the pod_state map is PIN_GLOBAL_NS, so its pin path is its stable identity. The write must
+// resolve a fresh fd from the pin path on every call and never trust the cached FD. Here we seed
+// the cached context with a deliberately bogus map FD and inject the pinned-map writer to record
+// the pin path it is handed. The test proves the write is driven by the podIdentifier's stable
+// pin path (not the cached FD) and that a write error propagates so the caller can retry. Runs
+// anywhere (no real BPF map required).
+func TestUpdatePodStateEbpfMaps_ResolvesFromPinPathNotCachedFD(t *testing.T) {
+	podIdentifier := "churn-a@default"
+	wantPin := utils.GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, "ingress")
+
+	orig := writePinnedPodStateEntry
+	defer func() { writePinnedPodStateEntry = orig }()
+	var gotPin string
+	var called bool
+	writePinnedPodStateEntry = func(pinPath string, key, value unsafe.Pointer, create bool) error {
+		called = true
+		gotPin = pinPath
+		// Return an error so we assert propagation without needing a real pinned map.
+		return errors.New("injected: no pinned map in test")
+	}
+
+	testBpfClient := &bpfClient{policyEndpointeBPFContext: new(sync.Map)}
+	// Bogus cached map FD: if the code regresses to using the cached handle it would target
+	// this fd instead of resolving the pin path, and the pin-path assertion below would fail.
+	testBpfClient.policyEndpointeBPFContext.Store(podIdentifier, BPFContext{
+		ingressPgmInfo: goelf.BpfData{
+			Program: goebpfprogs.BpfProgram{ProgFD: 45},
+			Maps:    map[string]goebpfmaps.BpfMap{utils.TC_INGRESS_POD_STATE_MAP: {MapFD: 4242}},
+		},
+	})
+
+	err := testBpfClient.UpdatePodStateEbpfMaps(podIdentifier, POD_STATE_MAP_KEY, DEFAULT_ALLOW, true, false)
+
+	assert.True(t, called, "pod_state write must go through the pin-path resolver, not the cached FD")
+	assert.Equal(t, wantPin, gotPin,
+		"must resolve the ingress pod_state map by its stable pin path for the podIdentifier")
+	assert.Error(t, err, "a pinned-map write error must propagate so the reconcile can retry")
 }

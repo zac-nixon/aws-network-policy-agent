@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -17,6 +18,7 @@ import (
 	goelf "github.com/aws/aws-ebpf-sdk-go/pkg/elfparser"
 	goebpfmaps "github.com/aws/aws-ebpf-sdk-go/pkg/maps"
 	"github.com/aws/aws-ebpf-sdk-go/pkg/tc"
+	goebpfutils "github.com/aws/aws-ebpf-sdk-go/pkg/utils"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/conntrack"
 	"github.com/aws/aws-network-policy-agent/pkg/ebpf/events"
 	fwrp "github.com/aws/aws-network-policy-agent/pkg/fwruleprocessor"
@@ -1202,6 +1204,36 @@ func (l *bpfClient) UpdateClusterPolicyEbpfMaps(podIdentifier string, ingressFir
 // podIdentifier under both the ingress and egress hooks. Used at probe-attach
 // time to put the pod into a defined default state (DEFAULT_ALLOW or
 // DEFAULT_DENY) before any policy rules are programmed.
+// writePinnedPodStateEntry writes key=value into the pod_state map currently pinned at pinPath.
+//
+// Root-cause fix for the stale-FD ingress blackhole: a pod_state map is PIN_GLOBAL_NS, so its
+// pin path (derived from the podIdentifier and direction) is its stable identity. A cached raw
+// map FD is NOT: after a program reload the kernel recycles fd numbers lowest-free-first, so a
+// cached FD can come to refer to a different bpf map (silent wrong write), a non-map object
+// (EINVAL), or a closed fd (EBADF). Writing through a stale cached FD leaves the real pod_state
+// entry unset, and the datapath fail-closes (BPF_DROP), ingress-blackholing every pod sharing
+// the podIdentifier until the agent restarts.
+//
+// We therefore resolve a FRESH fd from the pin path on every write and never trust a cached FD.
+// The freshly opened fd is closed after the write; the cached BpfMap handle is never used here.
+// Overridable in tests.
+var writePinnedPodStateEntry = func(pinPath string, key, value unsafe.Pointer, create bool) error {
+	info, err := (&goebpfmaps.BpfMap{}).GetMapFromPinPath(pinPath)
+	if err != nil {
+		return fmt.Errorf("resolve pinned map %s: %w", pinPath, err)
+	}
+	fd, err := goebpfutils.GetMapFDFromID(int(info.Id))
+	if err != nil {
+		return fmt.Errorf("open map id %d for pin %s: %w", info.Id, pinPath, err)
+	}
+	defer syscall.Close(fd)
+	m := goebpfmaps.BpfMap{MapFD: uint32(fd)}
+	if create {
+		return m.CreateMapEntry(uintptr(key), uintptr(value))
+	}
+	return m.CreateUpdateMapEntry(uintptr(key), uintptr(value), 0)
+}
+
 func (l *bpfClient) CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key int, state int) error {
 	keyval := uint32(key)
 	value, ok := l.policyEndpointeBPFContext.Load(podIdentifier)
@@ -1220,17 +1252,18 @@ func (l *bpfClient) CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key
 	var ingressErr, egressErr error
 	// CreateMapEntry uses BPF_NOEXIST and the SDK swallows EEXIST as nil,
 	// so repeated calls are no-ops and this function stays idempotent.
+	// The map is resolved fresh from its pin path (its stable identity), not from a cached FD.
 	if ingressProgInfo.Program.ProgFD != 0 {
-		mapToUpdate := ingressProgInfo.Maps[utils.TC_INGRESS_POD_STATE_MAP]
-		if err := mapToUpdate.CreateMapEntry(uintptr(unsafe.Pointer(&keyval)), uintptr(unsafe.Pointer(&podStateValue))); err != nil {
+		pinPath := utils.GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, "ingress")
+		if err := writePinnedPodStateEntry(pinPath, unsafe.Pointer(&keyval), unsafe.Pointer(&podStateValue), true); err != nil {
 			log().Errorf("Ingress Pod State entry create failed: %v", err)
 			sdkAPIErr.WithLabelValues("createPodStateEntry-ingress").Inc()
 			ingressErr = fmt.Errorf("ingress pod state entry create: %w", err)
 		}
 	}
 	if egressProgInfo.Program.ProgFD != 0 {
-		mapToUpdate := egressProgInfo.Maps[utils.TC_EGRESS_POD_STATE_MAP]
-		if err := mapToUpdate.CreateMapEntry(uintptr(unsafe.Pointer(&keyval)), uintptr(unsafe.Pointer(&podStateValue))); err != nil {
+		pinPath := utils.GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, "egress")
+		if err := writePinnedPodStateEntry(pinPath, unsafe.Pointer(&keyval), unsafe.Pointer(&podStateValue), true); err != nil {
 			log().Errorf("Egress Pod State entry create failed: %v", err)
 			sdkAPIErr.WithLabelValues("createPodStateEntry-egress").Inc()
 			egressErr = fmt.Errorf("egress pod state entry create: %w", err)
@@ -1246,8 +1279,6 @@ func (l *bpfClient) CreatePodStateEbpfEntryIfNotExists(podIdentifier string, key
 // independently and any errors are returned joined.
 func (l *bpfClient) UpdatePodStateEbpfMaps(podIdentifier string, key int, state int, updateIngress bool, updateEgress bool) error {
 
-	var ingressProgFD, egressProgFD int
-	var mapToUpdate goebpfmaps.BpfMap
 	var ingressErr, egressErr error
 	keyval := uint32(key)
 	value, ok := l.policyEndpointeBPFContext.Load(podIdentifier)
@@ -1264,12 +1295,13 @@ func (l *bpfClient) UpdatePodStateEbpfMaps(podIdentifier string, key int, state 
 	egressProgInfo := peBPFContext.egressPgmInfo
 	podStateValue := pod_state{state: uint8(state)}
 
+	// The map is resolved fresh from its pin path (its stable identity), not from the cached
+	// FD, which the kernel may have recycled to another object after a program reload.
 	if updateIngress && ingressProgInfo.Program.ProgFD != 0 {
-		ingressProgFD = ingressProgInfo.Program.ProgFD
-		mapToUpdate = ingressProgInfo.Maps[utils.TC_INGRESS_POD_STATE_MAP]
-		log().Infof("Pod has an Ingress hook attached. Update the corresponding map progFD: %d, mapName: %s, key: %d, value: %d", ingressProgFD, utils.TC_INGRESS_POD_STATE_MAP, keyval, podStateValue.state)
+		pinPath := utils.GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, "ingress")
+		log().Infof("Pod has an Ingress hook attached. Update pinned map: %s, key: %d, value: %d", pinPath, keyval, podStateValue.state)
 		start := time.Now()
-		ingressErr = mapToUpdate.CreateUpdateMapEntry(uintptr(unsafe.Pointer(&keyval)), uintptr(unsafe.Pointer(&podStateValue)), 0)
+		ingressErr = writePinnedPodStateEntry(pinPath, unsafe.Pointer(&keyval), unsafe.Pointer(&podStateValue), false)
 		sdkAPILatency.WithLabelValues("updateEbpfMap-ingress-podstate", fmt.Sprint(ingressErr != nil)).Observe(msSince(start))
 		if ingressErr != nil {
 			log().Errorf("Ingress Pod State Map update failed: %v", ingressErr)
@@ -1278,12 +1310,10 @@ func (l *bpfClient) UpdatePodStateEbpfMaps(podIdentifier string, key int, state 
 		}
 	}
 	if updateEgress && egressProgInfo.Program.ProgFD != 0 {
-		egressProgFD = egressProgInfo.Program.ProgFD
-		mapToUpdate = egressProgInfo.Maps[utils.TC_EGRESS_POD_STATE_MAP]
-
-		log().Infof("Pod has an Egress hook attached. Update the corresponding map progFD: %d, mapName: %s, key: %d, value: %d", egressProgFD, utils.TC_EGRESS_POD_STATE_MAP, keyval, podStateValue.state)
+		pinPath := utils.GetPodStateBPFMapPinPathFromPodIdentifier(podIdentifier, "egress")
+		log().Infof("Pod has an Egress hook attached. Update pinned map: %s, key: %d, value: %d", pinPath, keyval, podStateValue.state)
 		start := time.Now()
-		egressErr = mapToUpdate.CreateUpdateMapEntry(uintptr(unsafe.Pointer(&keyval)), uintptr(unsafe.Pointer(&podStateValue)), 0)
+		egressErr = writePinnedPodStateEntry(pinPath, unsafe.Pointer(&keyval), unsafe.Pointer(&podStateValue), false)
 		sdkAPILatency.WithLabelValues("updateEbpfMap-egress-podstate", fmt.Sprint(egressErr != nil)).Observe(msSince(start))
 		if egressErr != nil {
 			log().Errorf("Egress Map update failed: %v", egressErr)

@@ -64,7 +64,7 @@ import (
 )
 
 const (
-	blackholeChurnDuration = 30 * time.Minute
+	blackholeChurnDuration = 100 * time.Minute
 	blackholeGenSize       = 8                // pods per generation per podIdentifier
 	blackholeGenLifetime   = 18 * time.Second // gen lives (long enough to attach+write+become Ready), then drain to 0
 	blackholeGenGap        = 3 * time.Second  // empty window => next gen's first pod RELOADs
@@ -72,7 +72,7 @@ const (
 	blackholeProbePort     = 8080
 	// A healthy churn pod becomes Ready within a few seconds; anything Running-but-NotReady
 	// older than this is treated as ingress-blackholed.
-	blackholeReadyGrace = 8 * time.Second
+	blackholeReadyGrace = 20 * time.Second
 
 	sdkLogPath = "/npalog/ebpf-sdk.log"
 	npaLogPath = "/npalog/network-policy-agent.log"
@@ -92,6 +92,10 @@ var blackholePrefixes = []string{"churn-a", "churn-b", "churn-c", "churn-d"}
 var _ = Describe("Pod-state stale-FD blackhole under same-podIdentifier churn", Ordered, func() {
 
 	It("reproduces EINVAL pod_state write failures + ingress blackhole via multi-podIdentifier drain-to-zero reload churn", func() {
+		// When a leak is detected we flip preserveEnv (package-level, so the AfterSuite honors it
+		// too) to true so ALL cleanup paths — the DeferCleanups below, the churn goroutines' own
+		// deletes, AND the suite's namespace teardown — become no-ops, leaving the node's pods,
+		// probes, and maps in the reproduced-bad state for live inspection.
 		By("Selecting a single linux worker node to concentrate all churn onto")
 		nodes, err := getReproNodes()
 		Expect(err).ToNot(HaveOccurred())
@@ -108,8 +112,24 @@ var _ = Describe("Pod-state stale-FD blackhole under same-podIdentifier churn", 
 		reader := buildLogReaderPod(readerName, node.Name)
 		_, err = fw.PodManager.CreateAndWaitTillPodIsRunning(ctx, reader, 2*time.Minute)
 		Expect(err).ToNot(HaveOccurred())
-		DeferCleanup(func() { _ = fw.PodManager.DeleteAndWaitTillPodIsDeleted(ctx, reader) })
-		DeferCleanup(cleanupChurnPods)
+		DeferCleanup(func() {
+			if preserveEnv.Load() {
+				GinkgoWriter.Printf("Leak detected: PRESERVING log-reader pod %q for inspection "+
+					"(grep %s / %s inside it).\n", readerName, npaLogPath, sdkLogPath)
+				return
+			}
+			_ = fw.PodManager.DeleteAndWaitTillPodIsDeleted(ctx, reader)
+		})
+		DeferCleanup(func() {
+			if preserveEnv.Load() {
+				GinkgoWriter.Printf("Leak detected: PRESERVING churn pods (label app=churn-pod in ns %q). "+
+					"Clean up manually with: kubectl -n %s delete pod -l app=churn-pod --grace-period=0 --force\n",
+					namespace, namespace)
+				time.Sleep(100 * time.Minute)
+				return
+			}
+			cleanupChurnPods()
+		})
 
 		By("Recording baseline counts before churn (only NEW failures count as a repro)")
 		sdkBaseline := grepCount(readerName, sdkLogPath, sdkPattern)
@@ -150,7 +170,9 @@ var _ = Describe("Pod-state stale-FD blackhole under same-podIdentifier churn", 
 					}
 					select {
 					case <-stop:
-						deleteAll(gen)
+						if !preserveEnv.Load() {
+							deleteAll(gen)
+						}
 						return
 					case <-time.After(blackholeGenLifetime):
 					}
@@ -217,6 +239,14 @@ var _ = Describe("Pod-state stale-FD blackhole under same-podIdentifier churn", 
 		}
 
 		By("Stopping churn")
+		// If we reproduced the leak, keep the environment intact for inspection: the currently
+		// live churn pods stay put and the DeferCleanups become no-ops. Set BEFORE close(stop)
+		// so the goroutines observe it when they wake on the closed channel and skip deleteAll.
+		if found {
+			preserveEnv.Store(true)
+			GinkgoWriter.Printf("Leak detected -> environment will be PRESERVED (churn pods, probes, "+
+				"and maps left in place; reader pod %q kept for log access).\n", readerName)
+		}
 		close(stop)
 		wg.Wait()
 
@@ -233,11 +263,11 @@ var _ = Describe("Pod-state stale-FD blackhole under same-podIdentifier churn", 
 			if logRepro {
 				GinkgoWriter.Printf("REPRODUCED (logged) stale-FD blackhole. NEW pod_state / SDK write-failure lines:\n%s\n", firstHit)
 			} else {
-				GinkgoWriter.Printf("REPRODUCED (silent) stale-FD blackhole: churn pods stayed Running-but-NotReady across "+
-					"consecutive scans with NO write-failure log line — consistent with a recycled fd landing on a valid "+
+				GinkgoWriter.Printf("REPRODUCED (silent) stale-FD blackhole: churn pods stayed Running-but-NotReady across " +
+					"consecutive scans with NO write-failure log line — consistent with a recycled fd landing on a valid " +
 					"map (write succeeds into the wrong map; real pod_state stays empty; datapath drops).\n")
 			}
-			GinkgoWriter.Printf("Confirm with: 'ID of map to update: ID: N' in the agent log vs the live pinned map id "+
+			GinkgoWriter.Printf("Confirm with: 'ID of map to update: ID: N' in the agent log vs the live pinned map id " +
 				"(aws-eks-na-cli ebpf loaded-ebpfdata); N != live id proves a stale/recycled handle.\n")
 		}
 

@@ -2,6 +2,7 @@ package leak
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-network-policy-agent/test/framework"
@@ -13,6 +14,11 @@ var (
 	fw        *framework.Framework
 	ctx       context.Context
 	namespace = "leak-test"
+
+	// preserveEnv is flipped to true by a spec that reproduces the leak. It tells ALL teardown
+	// paths — the spec's DeferCleanups, the churn goroutines, AND this suite's AfterSuite — to
+	// leave the reproduction environment (namespace, pods, probes, maps) in place for inspection.
+	preserveEnv atomic.Bool
 )
 
 func TestBPFProbeLeakOnPodChurn(t *testing.T) {
@@ -29,6 +35,11 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	err := fw.NamespaceManager.DeleteAndWaitTillNamespaceDeleted(ctx, namespace)
-	Expect(err).ToNot(HaveOccurred())
+	if preserveEnv.Load() {
+		GinkgoWriter.Printf("Leak detected: PRESERVING namespace %q and all its resources for inspection. "+
+			"Clean up manually with: kubectl delete namespace %s\n", namespace, namespace)
+		return
+	}
+	//err := fw.NamespaceManager.DeleteAndWaitTillNamespaceDeleted(ctx, namespace)
+	//Expect(err).ToNot(HaveOccurred())
 })

@@ -1439,16 +1439,16 @@ func TestBpfClient_AttacheBPFProbes_ReportsFreshLoadAfterLastPodDeleted(t *testi
 
 	ingressPinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "ingress")
 	egressPinPath := utils.GetBPFPinPathFromPodIdentifier(podIdentifier, "egress")
-	loaded := func(pinPath string, progFD int) map[string]goelf.BpfData {
+	loaded := func(pinPath string, progFD int, podStateMap string) map[string]goelf.BpfData {
 		return map[string]goelf.BpfData{pinPath: {
 			Program: goebpfprogs.BpfProgram{ProgFD: progFD},
-			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}},
+			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}, podStateMap: {MapID: uint32(1000 + progFD)}},
 		}}
 	}
 	mockSDKClient := mock_bpfclient.NewMockBpfSDKClient(ctrl)
 	gomock.InOrder(
-		mockSDKClient.EXPECT().LoadBpfFile(gomock.Any(), podIdentifier).Return(loaded(ingressPinPath, 7), nil, nil),
-		mockSDKClient.EXPECT().LoadBpfFile(gomock.Any(), podIdentifier).Return(loaded(egressPinPath, 9), nil, nil),
+		mockSDKClient.EXPECT().LoadBpfFile(gomock.Any(), podIdentifier).Return(loaded(ingressPinPath, 7, utils.TC_INGRESS_POD_STATE_MAP), nil, nil),
+		mockSDKClient.EXPECT().LoadBpfFile(gomock.Any(), podIdentifier).Return(loaded(egressPinPath, 9, utils.TC_EGRESS_POD_STATE_MAP), nil, nil),
 	)
 	mockTCClient := mock_tc.NewMockBpfTc(ctrl)
 	mockTCClient.EXPECT().TCEgressAttach(gomock.Any(), 7, gomock.Any()).Return(nil)
@@ -1462,6 +1462,13 @@ func TestBpfClient_AttacheBPFProbes_ReportsFreshLoadAfterLastPodDeleted(t *testi
 	first, err := client.AttacheBPFProbes(newPod, podIdentifier, INTERFACE_COUNT_DEFAULT, true)
 	assert.NoError(t, err)
 	assert.True(t, first, "a fresh program load must be reported so the caller programs the new maps")
+	for _, mapID := range []uint32{1007, 1009} {
+		for _, key := range []int{POD_STATE_MAP_KEY, CLUSTER_POLICY_POD_STATE_MAP_KEY} {
+			state, seeded := seededPodState(mapID, uint32(key))
+			assert.True(t, seeded, "a freshly loaded program's pod_state map %d must be seeded at key %d, or the probe drops all traffic", mapID, key)
+			assert.Equal(t, uint8(DEFAULT_ALLOW), state)
+		}
+	}
 
 	// A second pod of the identifier reuses the programs.
 	otherPod := types.NamespacedName{Name: "ds-other", Namespace: "ns"}
@@ -1578,7 +1585,7 @@ func TestBpfClient_AttacheBPFProbes_ConfirmedLiveAttachSurvivesConcurrentDelete(
 	loaded := func(direction string, progFD int) map[string]goelf.BpfData {
 		return map[string]goelf.BpfData{utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction): {
 			Program: goebpfprogs.BpfProgram{ProgFD: progFD},
-			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}},
+			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}, podStateMapName(direction): {MapID: uint32(1000 + progFD)}},
 		}}
 	}
 	mockSDKClient := mock_bpfclient.NewMockBpfSDKClient(ctrl)
@@ -1628,7 +1635,7 @@ func TestBpfClient_AttacheBPFProbes_OnlyTheLoadingAttachIsFirstPod(t *testing.T)
 	loaded := func(direction string, progFD int) map[string]goelf.BpfData {
 		return map[string]goelf.BpfData{utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction): {
 			Program: goebpfprogs.BpfProgram{ProgFD: progFD},
-			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}},
+			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}, podStateMapName(direction): {MapID: uint32(1000 + progFD)}},
 		}}
 	}
 	mockSDKClient := mock_bpfclient.NewMockBpfSDKClient(ctrl)
@@ -1672,7 +1679,7 @@ func TestBpfClient_AttacheBPFProbes_FirstPodDecidedAfterConcurrentDelete(t *test
 	loaded := func(direction string, progFD int) map[string]goelf.BpfData {
 		return map[string]goelf.BpfData{utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction): {
 			Program: goebpfprogs.BpfProgram{ProgFD: progFD},
-			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}},
+			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}, podStateMapName(direction): {MapID: uint32(1000 + progFD)}},
 		}}
 	}
 	mockSDKClient := mock_bpfclient.NewMockBpfSDKClient(ctrl)
@@ -1720,7 +1727,7 @@ func TestBpfClient_AttacheBPFProbes_ConcurrentSiblingsLoadProgramsOnce(t *testin
 	loaded := func(direction string, progFD int) map[string]goelf.BpfData {
 		return map[string]goelf.BpfData{utils.GetBPFPinPathFromPodIdentifier(podIdentifier, direction): {
 			Program: goebpfprogs.BpfProgram{ProgFD: progFD},
-			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}},
+			Maps:    map[string]goebpfmaps.BpfMap{"m": {MapID: uint32(progFD)}, podStateMapName(direction): {MapID: uint32(1000 + progFD)}},
 		}}
 	}
 	mockSDKClient := mock_bpfclient.NewMockBpfSDKClient(ctrl)
@@ -2989,4 +2996,74 @@ func TestReattachAfterRestartKeepsPodFilteredKernel(t *testing.T) {
 	}
 	assert.Zero(t, watcher.detaches, "the pod's filters were detached")
 	assert.Equal(t, before, hookIDs(t, link), "the pod runs the same programs after the restart")
+}
+
+// A program whose pod_state cannot be seeded would drop every packet once attached, so the
+// attach fails before touching the veths and unloads what it loaded.
+func TestBpfClient_AttacheBPFProbes_PodStateSeedFailureUnloadsBoth(t *testing.T) {
+	client, _ := newRaceTestBpfClient(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	bpffs := recordBPFFS(t)
+	stubHostVeth(t)
+	origCreate := createPodStateEntry
+	t.Cleanup(func() { createPodStateEntry = origCreate })
+	createPodStateEntry = func(*goebpfmaps.BpfMap, uint32, pod_state) error { return errors.New("map full") }
+
+	pod := types.NamespacedName{Name: "job-a-x1", Namespace: "ns"}
+	podIdentifier := utils.GetPodIdentifier(pod.Name, pod.Namespace)
+	ingressLoad, _ := loadedProgram(t, podIdentifier, "ingress")
+	egressLoad, _ := loadedProgram(t, podIdentifier, "egress")
+	mockSDKClient := mock_bpfclient.NewMockBpfSDKClient(ctrl)
+	gomock.InOrder(
+		mockSDKClient.EXPECT().LoadBpfFile(gomock.Any(), podIdentifier).Return(ingressLoad, nil, nil),
+		mockSDKClient.EXPECT().LoadBpfFile(gomock.Any(), podIdentifier).Return(egressLoad, nil, nil),
+	)
+	// No attach is expected: the strict TC mock fails the test on any.
+	client.bpfSDKClient = mockSDKClient
+	client.bpfTCClient = mock_tc.NewMockBpfTc(ctrl)
+
+	_, err := client.AttacheBPFProbes(pod, podIdentifier, INTERFACE_COUNT_DEFAULT, true)
+	assert.ErrorContains(t, err, "map full")
+	assert.False(t, client.HasBPFContext(podIdentifier))
+	assert.Equal(t, concat(unloadPins(podIdentifier, "ingress"), unloadPins(podIdentifier, "egress")), bpffs.unpinned)
+	assertNotRegistered(t, client, pod)
+}
+
+// In strict mode a pod no network policy selects is denied, so that is the seeded baseline;
+// cluster policies have no default deny.
+func TestBpfClient_SeedPodState_StrictModeDeniesNetworkPolicyKey(t *testing.T) {
+	client, _ := newRaceTestBpfClient(t)
+	client.networkPolicyMode = string(utils.Strict)
+	podIdentifier := utils.GetPodIdentifier("seed-strict-x1", "ns")
+	client.policyEndpointeBPFContext.Store(podIdentifier, BPFContext{
+		ingressPgmInfo: goelf.BpfData{Maps: map[string]goebpfmaps.BpfMap{utils.TC_INGRESS_POD_STATE_MAP: {MapID: 3101}}},
+		egressPgmInfo:  goelf.BpfData{Maps: map[string]goebpfmaps.BpfMap{utils.TC_EGRESS_POD_STATE_MAP: {MapID: 3102}}},
+	})
+
+	for _, direction := range []string{"ingress", "egress"} {
+		assert.NoError(t, client.seedPodStateLocked(podIdentifier, direction))
+	}
+	for _, mapID := range []uint32{3101, 3102} {
+		state, _ := seededPodState(mapID, uint32(POD_STATE_MAP_KEY))
+		assert.Equal(t, uint8(DEFAULT_DENY), state)
+		state, _ = seededPodState(mapID, uint32(CLUSTER_POLICY_POD_STATE_MAP_KEY))
+		assert.Equal(t, uint8(DEFAULT_ALLOW), state)
+	}
+}
+
+func TestBpfClient_SeedPodState_MissingMapIsAnError(t *testing.T) {
+	client, _ := newRaceTestBpfClient(t)
+	podIdentifier := utils.GetPodIdentifier("seed-missing-x1", "ns")
+	client.policyEndpointeBPFContext.Store(podIdentifier, BPFContext{
+		ingressPgmInfo: goelf.BpfData{Maps: map[string]goebpfmaps.BpfMap{"m": {MapID: 3201}}},
+	})
+	assert.ErrorContains(t, client.seedPodStateLocked(podIdentifier, "ingress"), utils.TC_INGRESS_POD_STATE_MAP)
+}
+
+func podStateMapName(direction string) string {
+	if direction == "egress" {
+		return utils.TC_EGRESS_POD_STATE_MAP
+	}
+	return utils.TC_INGRESS_POD_STATE_MAP
 }

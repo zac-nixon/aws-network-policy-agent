@@ -988,6 +988,16 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 		}
 	}
 
+	// A freshly loaded program has an empty pod_state map, and the probe drops every packet
+	// while either key is missing. Seed both with the baseline before attaching, so a pod is
+	// never left dropping all traffic while its first programming pass is pending or retried.
+	for _, direction := range loadedDirections {
+		if err = l.seedPodStateLocked(podIdentifier, direction); err != nil {
+			log().Errorf("Failed to seed %s pod state for pod: %s in namespace %s error: %v", direction, pod.Name, pod.Namespace, err)
+			return false, err
+		}
+	}
+
 	for index, hostVethName := range hostVethNames {
 		log().Infof("AttacheBPFProbes for pod %s in namespace %s with hostVethName %s at interface %d", pod.Name, pod.Namespace, hostVethName, index)
 
@@ -1029,6 +1039,45 @@ func (l *bpfClient) AttacheBPFProbes(pod types.NamespacedName, podIdentifier str
 		currentPodSet.(map[string]struct{})[podNamespacedName] = struct{}{}
 	}
 	return firstPodInPodIdentifier, nil
+}
+
+// createPodStateEntry creates a pod_state entry unless one exists. Overridden in tests.
+var createPodStateEntry = func(podStateMap *goebpfmaps.BpfMap, key uint32, value pod_state) error {
+	return podStateMap.CreateMapEntry(uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&value)))
+}
+
+// seedPodStateLocked creates podIdentifier's pod_state entries for direction with the baseline
+// states: DEFAULT_DENY for network policies in strict mode and DEFAULT_ALLOW otherwise, and
+// DEFAULT_ALLOW for cluster policies. Entries that already exist are left alone. Callers must
+// hold the identifier lock.
+func (l *bpfClient) seedPodStateLocked(podIdentifier string, direction string) error {
+	value, ok := l.policyEndpointeBPFContext.Load(podIdentifier)
+	if !ok {
+		return fmt.Errorf("no bpf context registered for pod %s", podIdentifier)
+	}
+	peBPFContext := value.(BPFContext)
+	pgmInfo, mapName := peBPFContext.ingressPgmInfo, utils.TC_INGRESS_POD_STATE_MAP
+	if direction == "egress" {
+		pgmInfo, mapName = peBPFContext.egressPgmInfo, utils.TC_EGRESS_POD_STATE_MAP
+	}
+	podStateMap, ok := pgmInfo.Maps[mapName]
+	if !ok {
+		return fmt.Errorf("%s program for pod %s has no %s map", direction, podIdentifier, mapName)
+	}
+	networkPolicyState := DEFAULT_ALLOW
+	if utils.IsStrictMode(l.networkPolicyMode) {
+		networkPolicyState = DEFAULT_DENY
+	}
+	for _, entry := range []struct{ key, state int }{
+		{POD_STATE_MAP_KEY, networkPolicyState},
+		{CLUSTER_POLICY_POD_STATE_MAP_KEY, DEFAULT_ALLOW},
+	} {
+		if err := createPodStateEntry(&podStateMap, uint32(entry.key), pod_state{state: uint8(entry.state)}); err != nil {
+			sdkAPIErr.WithLabelValues("seedPodState-" + direction).Inc()
+			return fmt.Errorf("seed %s pod state key %d for pod %s: %w", direction, entry.key, podIdentifier, err)
+		}
+	}
+	return nil
 }
 
 // ensureBPFProgram loads podIdentifier's program for direction unless its context

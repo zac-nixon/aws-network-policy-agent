@@ -105,10 +105,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	policyEventsDenyOnly, validScope := config.ParsePolicyEventLogsScope(ctrlConfig.PolicyEventLogsScope)
-	if !validScope {
-		log.Warnf("Invalid --policy-event-logs-scope=%q; using \"all\" (valid values: all, deny)", ctrlConfig.PolicyEventLogsScope)
-	}
+	policyEventsDenyOnly, _ := config.ParsePolicyEventLogsScope(ctrlConfig.PolicyEventLogsScope)
 	ctx := ctrl.SetupSignalHandler()
 
 	var policyEndpointController *controllers.PolicyEndpointsReconciler
@@ -142,6 +139,7 @@ func main() {
 			log.Errorf("unable to create controller ClusterPolicyEndpoints %v", err)
 			os.Exit(1)
 		}
+		controllers.LinkProgrammers(policyEndpointController, clusterPolicyEndpointController)
 
 		readyzPaths := []string{ebpf.CONNTRACK_MAP_PIN_PATH, ebpf.POLICY_EVENTS_MAP_PIN_PATH}
 		if err := mgr.AddReadyzCheck("bpf-maps", ebpf.NewGlobalMapsReadinessCheck(readyzPaths)); err != nil {
